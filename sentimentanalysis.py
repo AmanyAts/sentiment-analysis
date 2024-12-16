@@ -2,136 +2,146 @@ import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
 from collections import Counter
-from transformers import DistilBertTokenizerFast, TFDistilBertForSequenceClassification
-import tensorflow as tf
-import nvtx  # NVTX for profiling annotations
+from transformers import DistilBertTokenizerFast, DistilBertForSequenceClassification
+import torch
+from torch import nn
+from torch.utils.data import DataLoader, TensorDataset
+import nvtx  # Import NVTX for profiling
+from numba import cuda  # Import Numba for CUDA
+import psutil
+from torch.cuda.amp import GradScaler, autocast
+
+@cuda.jit
+def preprocess_target_chunk(target, output):
+    """CUDA kernel to preprocess target values in a chunk."""
+    idx = cuda.grid(1)
+    if idx < target.size:
+        output[idx] = 1 if target[idx] == 4 else target[idx]
 
 def download_and_load_dataset():
-    """Loads and preprocesses the Sentiment140 dataset."""
+    """Loads and preprocesses the Sentiment140 dataset in chunks."""
     with nvtx.annotate("Function: download_and_load_dataset", color="blue"):
         DATASET_COLUMNS = ['target', 'ids', 'date', 'flag', 'user', 'text']
         DATASET_ENCODING = "ISO-8859-1"
-        
-        # Load the dataset correctly
-        df = pd.read_csv('sampled_dataset.csv', encoding=DATASET_ENCODING, header=0, names=DATASET_COLUMNS)
+        chunk_size = 100000
+        texts, targets = [], []
 
-        # Preprocess the dataset
-        data = df[['text', 'target']].copy()  # Create a copy to avoid SettingWithCopyWarning
-        data['target'] = data['target'].replace(4, 1)  # Convert positive labels (4 -> 1)
-        
-        # Ensure `target` is of integer type
-        data['target'] = data['target'].astype(int)
-        
-        # Remove duplicates and nulls
-        data = data.drop_duplicates().dropna()
+        for chunk in pd.read_csv('sampled_dataset.csv', encoding=DATASET_ENCODING, header=0, names=DATASET_COLUMNS, chunksize=chunk_size):
+            chunk = chunk[['text', 'target']].dropna().drop_duplicates()
 
-        return list(data['text']), list(data['target'])
+            # Prepare target preprocessing
+            target_array = chunk['target'].values
+            output_array = cuda.to_device(np.zeros_like(target_array))
+            d_target = cuda.to_device(target_array)
+
+            threads_per_block = 256
+            blocks_per_grid = (target_array.size + threads_per_block - 1) // threads_per_block
+            preprocess_target_chunk[blocks_per_grid, threads_per_block](d_target, output_array)
+
+            # Copy processed target back to host
+            chunk['target'] = output_array.copy_to_host()
+
+            texts.extend(chunk['text'].tolist())
+            targets.extend(chunk['target'].tolist())
+
+        return texts, targets
 
 def split_data(X, y, test_size=0.2, random_state=42):
     """Splits the dataset into training and testing sets with class balancing."""
     with nvtx.annotate("Function: split_data", color="green"):
-        print("Checking class distribution...")
         class_counts = Counter(y)
-        print(f"Class distribution before filtering: {class_counts}")
-
-        # Filter out classes with fewer than 2 samples
         valid_classes = [cls for cls, count in class_counts.items() if count >= 2]
         X_filtered = [x for x, label in zip(X, y) if label in valid_classes]
         y_filtered = [label for label in y if label in valid_classes]
 
-        print("Splitting data into train/test sets...")
         return train_test_split(X_filtered, y_filtered, test_size=test_size, random_state=random_state, stratify=y_filtered)
 
 def tokenize_data(X_train, X_test):
     """Tokenizes training and testing data using DistilBERT tokenizer."""
     with nvtx.annotate("Function: tokenize_data", color="yellow"):
         tokenizer = DistilBertTokenizerFast.from_pretrained("distilbert-base-uncased")
-        train_encodings = tokenizer(X_train, truncation=True, padding=True, max_length=128)
-        test_encodings = tokenizer(X_test, truncation=True, padding=True, max_length=128)
+        train_encodings = tokenizer(X_train, truncation=True, padding=True, max_length=128, return_tensors="pt")
+        test_encodings = tokenizer(X_test, truncation=True, padding=True, max_length=128, return_tensors="pt")
         return train_encodings, test_encodings
 
-def create_tf_datasets(train_encodings, test_encodings, y_train, y_test, batch_size=32):
-    """Creates TensorFlow datasets for training and testing."""
-    with nvtx.annotate("Function: create_tf_datasets", color="orange"):
-        train_dataset = tf.data.Dataset.from_tensor_slices((
-            dict(train_encodings),
-            y_train
-        )).batch(batch_size)
+def prepare_data_for_gpu(train_encodings, test_encodings, y_train, y_test):
+    """Prepares datasets for PyTorch DataLoader with GPU compatibility."""
+    with nvtx.annotate("Function: prepare_data_for_gpu", color="orange"):
+        train_dataset = TensorDataset(train_encodings['input_ids'], train_encodings['attention_mask'], torch.tensor(y_train))
+        test_dataset = TensorDataset(test_encodings['input_ids'], test_encodings['attention_mask'], torch.tensor(y_test))
 
-        test_dataset = tf.data.Dataset.from_tensor_slices((
-            dict(test_encodings),
-            y_test
-        )).batch(batch_size)
+        # DataLoader automatically batches data
+        train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+        test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
 
-        return train_dataset, test_dataset
+        return train_loader, test_loader
 
-def train_model(train_dataset, test_dataset, learning_rate=5e-5, epochs=3):
-    """Trains a DistilBERT model for sentiment analysis."""
+def train_model(train_loader, test_loader, learning_rate=5e-5, epochs=3):
+    """Trains a DistilBERT model for sentiment analysis on GPUs."""
     with nvtx.annotate("Function: train_model", color="red"):
-        # Load pre-trained DistilBERT model
-        model = TFDistilBertForSequenceClassification.from_pretrained("distilbert-base-uncased", num_labels=2)
+        model = DistilBertForSequenceClassification.from_pretrained("distilbert-base-uncased", num_labels=2)
+        model = nn.DataParallel(model)
+        model = model.to("cuda")
 
-        # Compile the model
-        model.compile(
-            optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
-            loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
-            metrics=["accuracy"]
-        )
+        optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+        loss_fn = nn.CrossEntropyLoss()
+        scaler = GradScaler()
 
-        # Train the model
-        model.fit(
-            train_dataset,
-            validation_data=test_dataset,
-            epochs=epochs
-        )
+        for epoch in range(epochs):
+            with nvtx.annotate(f"Epoch {epoch+1}", color="yellow"):
+                model.train()
+                for batch_idx, batch in enumerate(train_loader):
+                    with nvtx.annotate(f"Batch {batch_idx}", color="blue"):
+                        input_ids, attention_mask, labels = [x.to("cuda") for x in batch]
+                        optimizer.zero_grad()
+                        with autocast():
+                            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                            loss = loss_fn(outputs.logits, labels)
+                        scaler.scale(loss).backward()
+                        scaler.step(optimizer)
+                        scaler.update()
 
-        return model
+        torch.cuda.empty_cache()
 
-def evaluate_model(model, test_dataset):
+def evaluate_model(model, test_loader):
     """Evaluates the model on the test dataset."""
     with nvtx.annotate("Function: evaluate_model", color="purple"):
-        results = model.evaluate(test_dataset)
-        print(f"Test Loss: {results[0]}, Test Accuracy: {results[1]}")
-        return results
+        model.eval()
+        correct = 0
+        total = 0
 
-def make_predictions(model, test_dataset):
-    """Makes predictions on the test dataset."""
-    with nvtx.annotate("Function: make_predictions", color="cyan"):
-        predictions = model.predict(test_dataset)
-        predicted_classes = np.argmax(predictions.logits, axis=-1)
-        return predicted_classes
+        with torch.no_grad():
+            for batch in test_loader:
+                input_ids, attention_mask, labels = [x.to("cuda") for x in batch]
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                predictions = torch.argmax(outputs.logits, dim=1)
+                correct += (predictions == labels).sum().item()
+                total += labels.size(0)
 
-# Main Function to Execute the Workflow
+        print(f"Test Accuracy: {correct / total:.2%}")
+
 def main():
-        # Step 1: Load and preprocess the dataset
-        print("Starting dataset download and preprocessing...")
-        X, y = download_and_load_dataset()
-        
-        # Step 2: Split data into train/test sets
-        print("Splitting data into train/test sets...")
+    with nvtx.annotate("Function: main", color="cyan"):
+        print("Loading and preprocessing dataset...")
+        X, y = download_and_load_dataset()  # Chunked processing
+
+        print("Dataset Size: Rows =", len(X))
+        print("Splitting dataset...")
         X_train, X_test, y_train, y_test = split_data(X, y)
-        
-        # Step 3: Tokenize the data
+
         print("Tokenizing data...")
         train_encodings, test_encodings = tokenize_data(X_train, X_test)
-        
-        # Step 4: Prepare TensorFlow datasets
-        print("Creating TensorFlow datasets...")
-        train_dataset, test_dataset = create_tf_datasets(train_encodings, test_encodings, y_train, y_test)
-        
-        # Step 5: Train the model
-        print("Training the model...")
-        model = train_model(train_dataset, test_dataset)
-        
-        # Step 6: Evaluate the model
-        print("Evaluating the model...")
-        evaluate_model(model, test_dataset)
-        
-        # Step 7: Make predictions
-        print("Making predictions...")
-        predicted_classes = make_predictions(model, test_dataset)
-        print("Predicted Classes (First 10):", predicted_classes[:10])
 
-# Execute the main function
+        print("Preparing DataLoader...")
+        train_loader, test_loader = prepare_data_for_gpu(train_encodings, test_encodings, y_train, y_test)
+
+        print("Training model...")
+        train_model(train_loader, test_loader)
+
+        print("Evaluating model...")
+        evaluate_model(train_model, test_loader)
+
+        print(f"Memory Usage: {psutil.virtual_memory().percent}%")
+
 if __name__ == "__main__":
     main()
