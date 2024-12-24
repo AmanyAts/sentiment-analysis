@@ -1,206 +1,359 @@
-#include <cuda_runtime.h>
-#include <nvtx3/nvToolsExt.h>
-#include <iostream>
-#include <vector>
-#include <string>
-#include <fstream>
-#include <sstream>
-#include <algorithm>
-#include <numeric>
-#include <cmath>
-#include <cstdlib>  // For rand()
-#include <ctime>    // For seeding rand()
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <time.h>
+#include <cuda_runtime.h> // Include for CUDA support
 
-#define MAX_TOKENS 128
-#define NUM_FEATURES 128
+#define MAX_TOKENS 1024
+#define NUM_FEATURES 1024
 
-// CUDA kernel for tokenization
-__global__ void tokenize(char* text, float* token_ids, int text_size, int num_texts) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < text_size) {
-        int text_idx = idx / MAX_TOKENS;
-        int char_idx = idx % MAX_TOKENS;
-        if (text_idx < num_texts && char_idx < MAX_TOKENS) {
-            token_ids[idx] = (float)(text[idx]) / 255.0f;  // Normalize to range [0, 1]
-        }
+typedef struct {
+    char text[MAX_TOKENS];
+    int label;
+} Post;
+
+// Device version of custom_strlen (for GPU use)
+__device__ int custom_strlen_device(const char *str) {
+    int length = 0;
+    while (str[length] != '\0') {
+        length++;
+    }
+    return length;
+}
+
+// Helper: Allocate memory and handle failure
+void *safe_malloc(size_t size) {
+    void *ptr = malloc(size);
+    if (!ptr) {
+        printf("Error: Memory allocation failed.\n");
+        exit(1);
+    }
+    return ptr;
+}
+
+// Shuffle the dataset to randomize it
+void shuffleDataset(Post *dataset, int num_samples) {
+    srand(time(NULL));  // Seed for randomness
+    for (int i = 0; i < num_samples; i++) {
+        int j = rand() % num_samples;
+        // Swap elements
+        Post temp = dataset[i];
+        dataset[i] = dataset[j];
+        dataset[j] = temp;
     }
 }
 
-// CUDA kernel for forward propagation (dense layer)
-__global__ void dense_layer(float* inputs, float* weights, float* biases, float* outputs, int num_samples, int num_features) {
+// CUDA kernel for tokenization and embedding (parallelized)
+__global__ void tokenizeAndEmbedKernel(Post *dataset, float *token_ids, int num_samples) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < num_samples) {
-        for (int j = 0; j < num_features; j++) {
-            outputs[idx * num_features + j] = biases[j];
-            for (int k = 0; k < num_features; k++) {
-                outputs[idx * num_features + j] += inputs[idx * num_features + k] * weights[j * num_features + k];
-            }
-            // Clamp outputs to prevent overflow in activation
-            outputs[idx * num_features + j] = max(-10.0f, min(10.0f, outputs[idx * num_features + j]));
+        for (int j = 0; j < custom_strlen_device(dataset[idx].text); j++) {
+            token_ids[idx * MAX_TOKENS + j] = (float)(dataset[idx].text[j]) / 255.0f;
         }
     }
 }
 
-// CUDA kernel for sigmoid activation
-__global__ void sigmoid_activation(float* outputs, int size) {
+// CUDA kernel for dense layer computation (parallelized)
+__global__ void denseLayerKernel(float *inputs, float *weights, float *biases, float *outputs, int num_samples, int embedding_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < num_samples) {
+        outputs[idx] = biases[0]; // Start with the bias
+        for (int k = 0; k < embedding_size; k++) {
+            outputs[idx] += inputs[idx * embedding_size + k] * weights[k]; // Only one output
+        }
+    }
+}
+
+// CUDA kernel for sigmoid activation (parallelized)
+__global__ void sigmoidActivationKernel(float *outputs, int size) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size) {
         outputs[idx] = 1.0f / (1.0f + expf(-outputs[idx]));
     }
 }
 
-// Function to load dataset and extract text and labels
-std::vector<std::pair<std::string, int>> load_dataset_with_labels(const std::string& filename) {
-    nvtxRangePushA("Load Dataset");
-    std::ifstream file(filename);
-    std::vector<std::pair<std::string, int>> dataset;
-    std::string line;
+// Memory allocation for GPU
+void *cuda_malloc(size_t size) {
+    void *ptr;
+    cudaError_t err = cudaMalloc(&ptr, size);
+    if (err != cudaSuccess) {
+        printf("CUDA error: %s\n", cudaGetErrorString(err));
+        exit(1);
+    }
+    return ptr;
+}
 
-    // Skip the header line
-    std::getline(file, line);
+// Copy data from host to device
+void cuda_memcpy_to_device(void *device_ptr, void *host_ptr, size_t size) {
+    cudaError_t err = cudaMemcpy(device_ptr, host_ptr, size, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        printf("CUDA error: %s\n", cudaGetErrorString(err));
+        exit(1);
+    }
+}
 
-    while (std::getline(file, line)) {
-        std::istringstream iss(line);
-        std::string target, ids, date, flag, user, text;
+// Copy data from device to host
+void cuda_memcpy_to_host(void *host_ptr, void *device_ptr, size_t size) {
+    cudaError_t err = cudaMemcpy(host_ptr, device_ptr, size, cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        printf("CUDA error: %s\n", cudaGetErrorString(err));
+        exit(1);
+    }
+}
 
-        // Assuming the dataset columns are: target, ids, date, flag, user, text
-        if (std::getline(iss, target, ',') &&  // Extract target (label)
-            std::getline(iss, ids, ',') &&
-            std::getline(iss, date, ',') &&
-            std::getline(iss, flag, ',') &&
-            std::getline(iss, user, ',') &&
-            std::getline(iss, text, ',')) {
-            
-            int label = std::stoi(target);
-            if (label == 4) label = 1;  // Convert positive sentiment (4) to 1
-            dataset.emplace_back(text, label);  // Pair text with its label
+// Load dataset from file
+int loadDataset(const char *filename, Post **dataset) {
+    FILE *file = fopen(filename, "r");
+    if (!file) {
+        printf("Error: Could not open file %s\n", filename);
+        exit(1);
+    }
+
+    size_t capacity = 1000;
+    size_t count = 0;
+    *dataset = (Post *)safe_malloc(capacity * sizeof(Post));
+
+    char line[1024];
+    while (fgets(line, sizeof(line), file)) {
+        if (count >= capacity) {
+            capacity *= 2;
+            *dataset = (Post *)realloc(*dataset, capacity * sizeof(Post));
+            if (!*dataset) {
+                printf("Error: Memory reallocation failed.\n");
+                fclose(file);
+                exit(1);
+            }
+        }
+
+        // Read label (first column of dataset)
+        char *token = strtok(line, ",");
+        if (!token) continue;
+
+        (*dataset)[count].label = atoi(token);  // Use numeric labels (0 for negative, 4 for positive)
+
+        // Skip unnecessary columns (3rd, 4th, and 5th columns)
+        token = strtok(NULL, ",");
+        for (int i = 0; i < 3; i++) {
+            token = strtok(NULL, ",");
+        }
+
+        // Read the tweet content (last column)
+        token = strtok(NULL, "\n");
+        if (token) {
+            strncpy((*dataset)[count].text, token, MAX_TOKENS - 1);
+            (*dataset)[count].text[MAX_TOKENS - 1] = '\0';
+            count++;
         }
     }
-    nvtxRangePop();
-    return dataset;
+
+    fclose(file);
+    return count;
 }
 
+// Load and split the dataset into training and testing
+int loadAndSplitDataset(const char *filename, Post **trainSet, Post **testSet, int *trainSize, int *testSize) {
+    clock_t start_time = clock(); // Start time measurement
+    Post *dataset = NULL;
+    int num_samples = loadDataset(filename, &dataset);  // Load entire dataset
 
-// Preprocess text data and labels
-void preprocess_text(const std::vector<std::pair<std::string, int>>& dataset, char* text_array, int* labels, int max_tokens) {
-    nvtxRangePushA("Preprocess Text");
-    for (size_t i = 0; i < dataset.size(); i++) {
-        const std::string& text = dataset[i].first;
-        labels[i] = dataset[i].second;  // Extract labels
-        std::string truncated_text = text.substr(0, max_tokens);
-        std::copy(truncated_text.begin(), truncated_text.end(), text_array + i * max_tokens);
+    // Shuffle the dataset to randomize the order
+    shuffleDataset(dataset, num_samples);
+
+    // Split into 70% training and 30% testing
+    *trainSize = (int)(num_samples * 0.7);
+    *testSize = num_samples - *trainSize;
+
+    // Allocate memory for the training and testing sets
+    *trainSet = (Post *)safe_malloc(*trainSize * sizeof(Post));
+    *testSet = (Post *)safe_malloc(*testSize * sizeof(Post));
+
+    // Copy the data into the train and test sets
+    for (int i = 0; i < *trainSize; i++) {
+        (*trainSet)[i] = dataset[i];
     }
-    nvtxRangePop();
+    for (int i = 0; i < *testSize; i++) {
+        (*testSet)[i] = dataset[*trainSize + i];
+    }
+
+    free(dataset);  // Free the original dataset after splitting
+    clock_t end_time = clock(); // End time measurement
+    double execution_time = ((double)(end_time - start_time)) / CLOCKS_PER_SEC;
+    printf("Loading and Splitting Time: %.4f seconds\n", execution_time);
+
+    return num_samples;
 }
 
-// Evaluate the model's accuracy
-float evaluate_model(float* predictions, int* labels, int num_samples) {
-    nvtxRangePushA("Evaluate Model");
+// Modified tokenization using hash function (previously used ASCII values)
+void tokenizeAndEmbed(Post *dataset, float *token_ids, int num_samples) {
+    clock_t start_time = clock(); // Start time measurement
+
+    int block_size = 256;  // Number of threads per block
+    int grid_size = (num_samples + block_size - 1) / block_size;  // Number of blocks
+
+    // Launch the kernel to tokenize and embed the dataset
+    tokenizeAndEmbedKernel<<<grid_size, block_size>>>(dataset, token_ids, num_samples);
+
+    // Wait for GPU to finish before measuring the time
+    cudaDeviceSynchronize();
+
+    clock_t end_time = clock(); // End time measurement
+    double execution_time = ((double)(end_time - start_time)) / CLOCKS_PER_SEC;
+    printf("Tokenization Time: %.4f seconds\n", execution_time);
+}
+
+// Random weight initialization using Xavier method
+void init_weights(float *weights, int num_features) {
+    clock_t start_time = clock(); // Start time measurement
+
+    for (int i = 0; i < num_features * num_features; i++) {
+        weights[i] = ((float)rand() / RAND_MAX) * sqrt(2.0f / num_features); // Xavier initialization
+    }
+
+    clock_t end_time = clock(); // End time measurement
+    double execution_time = ((double)(end_time - start_time)) / CLOCKS_PER_SEC;
+    printf("Weight Initialization Time: %.4f seconds\n", execution_time);
+}
+
+// Dense layer computation
+void denseLayer(float *inputs, float *weights, float *biases, float *outputs, int num_samples, int embedding_size) {
+    clock_t start_time = clock(); // Start time measurement
+
+    int block_size = 256;  // Number of threads per block
+    int grid_size = (num_samples + block_size - 1) / block_size;  // Number of blocks
+
+    // Launch the kernel to compute the dense layer
+    denseLayerKernel<<<grid_size, block_size>>>(inputs, weights, biases, outputs, num_samples, embedding_size);
+
+    // Wait for GPU to finish before measuring the time
+    cudaDeviceSynchronize();
+
+    clock_t end_time = clock(); // End time measurement
+    double execution_time = ((double)(end_time - start_time)) / CLOCKS_PER_SEC;
+    printf("Dense Layer Time: %.4f seconds\n", execution_time);
+}
+
+// Apply sigmoid activation
+void sigmoidActivation(float *outputs, int size) {
+    clock_t start_time = clock(); // Start time measurement
+
+    int block_size = 256;  // Number of threads per block
+    int grid_size = (size + block_size - 1) / block_size;  // Number of blocks
+
+    // Launch the kernel to apply sigmoid activation
+    sigmoidActivationKernel<<<grid_size, block_size>>>(outputs, size);
+
+    // Wait for GPU to finish before measuring the time
+    cudaDeviceSynchronize();
+
+    clock_t end_time = clock(); // End time measurement
+    double execution_time = ((double)(end_time - start_time)) / CLOCKS_PER_SEC;
+    printf("Sigmoid Activation Time: %.4f seconds\n", execution_time);
+}
+
+// Evaluate model predictions
+float evaluate(float *outputs, int *labels, int num_samples) {
+    clock_t start_time = clock(); // Start time measurement
+
     int correct = 0;
-    for (int i = 0; i < num_samples; i++) {
-        int pred_label = predictions[i] > 0.5 ? 1 : 0;
-        if (pred_label == labels[i]) correct++;
-    }
-    nvtxRangePop();
-    return static_cast<float>(correct) / num_samples;
-}
 
-// Debugging: Print intermediate results
-void debug_print_labels(const std::vector<int>& labels, int limit = 10) {
-    std::cout << "Labels (first " << limit << "): ";
-    for (int i = 0; i < std::min((int)labels.size(), limit); i++) {
-        std::cout << labels[i] << " ";
+    for (int i = 0; i < num_samples; i++) {
+        int predicted_label = outputs[i] > 0.6f ? 4 : 0; // If > 0.6, predict positive (4), else negative (0)
+        if (predicted_label == labels[i]) {
+            correct++;
+        }
     }
-    std::cout << "\n";
+
+    clock_t end_time = clock(); // End time measurement
+    double execution_time = ((double)(end_time - start_time)) / CLOCKS_PER_SEC;
+    printf("Evaluation Time: %.4f seconds\n", execution_time);
+
+    return (float)correct / num_samples;
 }
 
 int main() {
-    const int max_tokens = MAX_TOKENS;
-    const int num_features = NUM_FEATURES;
+    clock_t start_time = clock(); // Start time measurement
 
-    // Load dataset and dynamically determine the number of samples
-    nvtxRangePushA("Main Function");
-    auto dataset = load_dataset_with_labels("sampled_dataset.csv");
-    int num_samples = dataset.size();  // Adjust based on dataset size
+    printf("Starting program...\n");
 
-    // Allocate memory for labels
-    std::vector<int> labels(num_samples);
+    Post *trainSet = NULL, *testSet = NULL;
+    int trainSize, testSize;
+    int num_samples = loadAndSplitDataset("training.1600000.processed.noemoticon.csv", &trainSet, &testSet, &trainSize, &testSize);
 
-    // Preprocess text
-    char* text_array = new char[num_samples * max_tokens];
-    preprocess_text(dataset, text_array, labels.data(), max_tokens);
-
-    // Debug: Print the first few labels
-    debug_print_labels(labels);
-
-    // Allocate GPU memory for text data and token IDs
-    nvtxRangePushA("Allocate GPU Memory");
-    char* d_text_array;
-    float* d_token_ids;
-    cudaMalloc(&d_text_array, num_samples * max_tokens * sizeof(char));
-    cudaMalloc(&d_token_ids, num_samples * max_tokens * sizeof(float));
-    nvtxRangePop();
-
-    cudaMemcpy(d_text_array, text_array, num_samples * max_tokens * sizeof(char), cudaMemcpyHostToDevice);
-
-    // Tokenize text on GPU
-    nvtxRangePushA("Tokenization Kernel");
-    int blockSize = 256;
-    int numBlocks = (num_samples * max_tokens + blockSize - 1) / blockSize;
-    tokenize<<<numBlocks, blockSize>>>(d_text_array, d_token_ids, num_samples * max_tokens, num_samples);
-    cudaDeviceSynchronize();
-    nvtxRangePop();
-
-    // Initialize weights and biases
-    nvtxRangePushA("Dense Layer Preparation");
-    srand(time(0));  // Seed random number generator
-    std::vector<float> h_weights(num_features * num_features);
-    std::vector<float> h_biases(num_features, 0.0f);
-    std::vector<float> h_outputs(num_samples * num_features, 0.0f);
-
-    for (auto& weight : h_weights) {
-        weight = static_cast<float>(rand()) / RAND_MAX * 0.01f;  // Initialize small random weights
+    if (trainSize == 0 || testSize == 0) {
+        printf("Error: No samples found in dataset.\n");
+        return 1;
     }
 
-    float* d_weights;
-    float* d_biases;
-    float* d_outputs;
+    printf("Loaded %d training samples and %d test samples.\n", trainSize, testSize);
 
-    cudaMalloc(&d_weights, num_features * num_features * sizeof(float));
-    cudaMalloc(&d_biases, num_features * sizeof(float));
-    cudaMalloc(&d_outputs, num_samples * num_features * sizeof(float));
+    // Memory for the labels and token IDs for training
+    int *trainLabels = (int *)safe_malloc(trainSize * sizeof(int));
+    for (int i = 0; i < trainSize; i++) {
+        trainLabels[i] = trainSet[i].label;
+    }
 
-    cudaMemcpy(d_weights, h_weights.data(), num_features * num_features * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_biases, h_biases.data(), num_features * sizeof(float), cudaMemcpyHostToDevice);
-    nvtxRangePop();
+    float *trainTokenIds = (float *)safe_malloc(trainSize * MAX_TOKENS * sizeof(float));
+    float *trainWeights = (float *)safe_malloc(NUM_FEATURES * NUM_FEATURES * sizeof(float));
+    float *trainBiases = (float *)safe_malloc(NUM_FEATURES * sizeof(float));
+    float *trainOutputs = (float *)safe_malloc(trainSize * NUM_FEATURES * sizeof(float));
 
-    // Dense layer execution
-    nvtxRangePushA("Dense Layer Execution");
-    dense_layer<<<numBlocks, blockSize>>>(d_token_ids, d_weights, d_biases, d_outputs, num_samples, num_features);
-    cudaDeviceSynchronize();
-    nvtxRangePop();
+    srand(time(NULL));
+    init_weights(trainWeights, NUM_FEATURES);
 
-    // Apply sigmoid activation
-    nvtxRangePushA("Sigmoid Activation Kernel");
-    sigmoid_activation<<<numBlocks, blockSize>>>(d_outputs, num_samples * num_features);
-    cudaDeviceSynchronize();
-    nvtxRangePop();
+    for (int i = 0; i < NUM_FEATURES; i++) {
+        trainBiases[i] = 0.0f;
+    }
 
-    // Copy results back for debugging
-    cudaMemcpy(h_outputs.data(), d_outputs, num_samples * num_features * sizeof(float), cudaMemcpyDeviceToHost);
+    // Tokenizing and embedding training dataset
+    tokenizeAndEmbed(trainSet, trainTokenIds, trainSize);
 
-    // Evaluate model
-    float accuracy = evaluate_model(h_outputs.data(), labels.data(), num_samples);
-    std::cout << "Model Accuracy: " << accuracy * 100 << "%" << std::endl;
+    // Train the model with the training set
+    denseLayer(trainTokenIds, trainWeights, trainBiases, trainOutputs, trainSize, NUM_FEATURES);
+
+    // Apply sigmoid activation for training set
+    sigmoidActivation(trainOutputs, trainSize);
+
+    // Evaluate on the test set (after training)
+    float accuracy = evaluate(trainOutputs, trainLabels, trainSize);
+
+    // Now, evaluate on test set
+    int *testLabels = (int *)safe_malloc(testSize * sizeof(int));
+    for (int i = 0; i < testSize; i++) {
+        testLabels[i] = testSet[i].label;
+    }
+
+    float *testTokenIds = (float *)safe_malloc(testSize * MAX_TOKENS * sizeof(float));
+    float *testOutputs = (float *)safe_malloc(testSize * NUM_FEATURES * sizeof(float));
+
+    // Tokenizing and embedding test dataset
+    tokenizeAndEmbed(testSet, testTokenIds, testSize);
+
+    // Use the trained model to make predictions on the test set
+    denseLayer(testTokenIds, trainWeights, trainBiases, testOutputs, testSize, NUM_FEATURES);
+
+    // Apply sigmoid activation for test set
+    sigmoidActivation(testOutputs, testSize);
+
+    // Evaluate the test set
+    float testAccuracy = evaluate(testOutputs, testLabels, testSize);
+    printf("Test set Accuracy: %.2f%%\n", testAccuracy * 100);
+
+    clock_t end_time = clock(); // End time measurement
+    double execution_time = ((double)(end_time - start_time)) / CLOCKS_PER_SEC;
+    printf("Total Execution Time: %.4f seconds\n", execution_time);
 
     // Free memory
-    cudaFree(d_text_array);
-    cudaFree(d_token_ids);
-    cudaFree(d_weights);
-    cudaFree(d_biases);
-    cudaFree(d_outputs);
-    delete[] text_array;
+    free(trainSet);
+    free(testSet);
+    free(trainLabels);
+    free(testLabels);
+    free(trainTokenIds);
+    free(testTokenIds);
+    free(trainWeights);
+    free(trainBiases);
+    free(trainOutputs);
+    free(testOutputs);
 
-    nvtxRangePop(); // End of Main Function
     return 0;
 }
